@@ -1,0 +1,117 @@
+#!/bin/sh
+set -u
+
+container=traefik-cert-dumper
+version=1.0
+ryodi=1
+
+command=${1:-help}
+case $command in
+help)
+  cat <<EOF
+
+  #######    ## ##    ########  #####   ##
+ ##     ##   ## ##   ##  ##  ## ## ##  ##
+ ## ### ## ######### ##  ##     ##### ##
+ ## ### ##   ## ##    ########       ##
+ ## #####  #########     ##  ##     ## #####
+ ##          ## ##   ##  ##  ##    ##  ## ##
+  #######    ## ##    ########    ##   #####
+
+
+
+USAGE: docker run -it $container [command]
+
+Known Commands
+--------------
+
+  help       Print the help and then exit.
+
+  version    Print the version and then exit.
+
+  info       Print an informative message about
+             this container (its purpose, how it
+             works, etc.) and then exit.
+
+  list       List certificates known to Traefik.
+
+  dump       Dump certificates and their keys,
+             from Traefik, to /dump (which you
+             probably want to mount in via -v).
+
+  watch      Watch Traefik for renewals and new
+             certificates, and dump them to /dump.
+
+EOF
+  exit 0
+  ;;
+
+version)
+  echo "$container v$version (ryodi v$ryodi)"
+  exit 0
+  ;;
+
+info)
+  echo >&2 "$command: not implemented yet!"
+  exit 42
+  ;;
+
+list)
+  exec traefik-certs-dumper file \
+    --source /acme.json \
+    --domain-subdir \
+    --key-name=key  --key-ext=.pem \
+    --crt-name=cert --crt-ext=.pem \
+    --dest=/traefik/certificates
+  exit 42
+  ;;
+
+dump)
+  exec traefik-certs-dumper file \
+    --source /acme.json \
+    --domain-subdir \
+    --key-name=key  --key-ext=.pem \
+    --crt-name=cert --crt-ext=.pem \
+    --dest=/dump
+  exit 42
+  ;;
+
+watch)
+  exec traefik-certs-dumper file \
+    --source /acme.json \
+    --domain-subdir \
+    --key-name=key  --key-ext=.pem \
+    --crt-name=cert --crt-ext=.pem \
+    --dest=/dump \
+    --watch
+  exit 42
+  ;;
+
+--changelog)
+  cat <<EOF
+
+  #######    ## ##    ########  #####   ##
+ ##     ##   ## ##   ##  ##  ## ## ##  ##
+ ## ### ## ######### ##  ##     ##### ##
+ ## ### ##   ## ##    ########       ##
+ ## #####  #########     ##  ##     ## #####
+ ##          ## ##   ##  ##  ##    ##  ## ##
+  #######    ## ##    ########    ##   #####
+
+EOF
+  cat /var/lib/ryodi/CHANGELOG
+  exit 0
+  ;;
+
+/*)
+  export PS1="[$container/$version | ryodi/$ryodi] \\$ "
+  exec "$@"
+  exit 42
+  ;;
+
+*)
+  echo >&2 "Unrecognized command '$command'!"
+  exit 1
+  ;;
+
+esac
