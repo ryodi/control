@@ -1,0 +1,8 @@
+#!/bin/sh
+
+commit=$(git rev-parse HEAD)
+if git status -uno --porcelain | grep -q .; then
+  commit="${commit}+"
+fi
+
+echo "$commit"

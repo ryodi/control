@@ -10,8 +10,20 @@ RUN mkdir -p /d/bin \
  && chmod 0755 /d/bin/* \
  && cp /etc/ssl/cert.pem /d/ca.pem
 
+#########################################################
 
 FROM scratch
+
+ARG version
+ARG builddate
+ARG commitish
+ARG repository
+
+LABEL com.ryodi.img.version="$version"
+LABEL com.ryodi.img.builddate="$builddate"
+LABEL com.ryodi.img.repository="$repository"
+LABEL com.ryodi.img.commitish="$commitish"
+LABEL maintainer="The RYODI Project <images@ryodi.com>"
 
 COPY --from=stage1 /d .
 
