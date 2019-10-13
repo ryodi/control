@@ -58,7 +58,7 @@ info)
 
 list)
   exec traefik-certs-dumper file \
-    --source /acme.json \
+    --source /acme/acme.json \
     --domain-subdir \
     --key-name=key  --key-ext=.pem \
     --crt-name=cert --crt-ext=.pem \
@@ -68,7 +68,7 @@ list)
 
 dump)
   exec traefik-certs-dumper file \
-    --source /acme.json \
+    --source /acme/acme.json \
     --domain-subdir \
     --key-name=key  --key-ext=.pem \
     --crt-name=cert --crt-ext=.pem \
@@ -78,7 +78,7 @@ dump)
 
 watch)
   exec traefik-certs-dumper file \
-    --source /acme.json \
+    --source /acme/acme.json \
     --domain-subdir \
     --key-name=key  --key-ext=.pem \
     --crt-name=cert --crt-ext=.pem \
