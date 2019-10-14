@@ -1,0 +1,262 @@
+#!/bin/bash
+set -eu
+
+# internal declarations, to clean up this script.
+vmaildb=/mail/vmail.db
+vmail_uid=999
+vmail_gid=999
+getent group  $vmail_gid | groupadd -g $vmail_gid vmail
+getent passwd $vmail_uid | useradd  -g $vmail_gid -u $vmail_uid -d /mail/boxes -s /sbin/nologin vmail
+
+log() {
+	echo "[$(date +%Y%m%d.%H%M%S)] " "$@"
+}
+
+mkdir -p /mail/boxes
+chown ${vmail_uid}:${vmail_gid} /mail/boxes
+
+log "Checking Docker container environment..."
+if [[ -z "${PRIMARY_DOMAIN:-}" ]]; then
+  echo >&2 "PRIMARY_DOMAIN not set in environment."
+  exit 1
+fi
+
+
+log "Checking for vmail configuration database ($vmaildb)..."
+if [[ ! -f $vmaildb ]]; then
+	echo "  - database $vmaildb not found; creating it..."
+	mkdir -p $(dirname $vmaildb)
+	vmail schema | sqlite3 $vmaildb
+fi
+
+log "Checking for ${PRIMARY_DOMAIN} in virtual domains table..."
+if ! vmail ls domains | grep -q "virtual: ${PRIMARY_DOMAIN}$"; then
+	vmail add domain virtual:${PRIMARY_DOMAIN}
+	vmail add mbox 'postmaster@'${PRIMARY_DOMAIN} Postmaster $(dd if=/dev/urandom bs=1 count=32 2>/dev/null | base64)
+	for alias in abuse hostmaster; do
+		vmail add alias ${alias}'@'${PRIMARY_DOMAIN} 'postmaster@'${PRIMARY_DOMAIN}
+	done
+fi
+
+log "Configuring Postfix SMTP relay / inbound mail server..."
+echo "$PRIMARY_DOMAIN" > /etc/postfix/canonical
+cat > /etc/postfix/main.cf <<EOF
+compatibility_level  = 2
+
+mydomain             = $PRIMARY_DOMAIN
+myorigin             = \$mydomain
+smtpd_banner         = \$myhostname ESMTP
+biff                 = no
+append_dot_mydomain  = no
+
+sendmail_path        = /usr/sbin/sendmail
+newaliases_path      = /usr/bin/newaliases
+mailq_path           = /usr/bin/mailq
+
+command_directory    = /usr/sbin
+manpage_directory    = /usr/share/man
+daemon_directory     = /usr/lib/postfix/sbin
+shlib_directory      = /usr/lib/postfix
+queue_directory      = /var/spool/postfix
+data_directory       = /var/lib/postfix
+
+mail_owner           = postfix
+setgid_group         = postdrop
+
+smtpd_tls_cert_file  = /mail/tls/\${mydomain}.cer
+smtpd_tls_key_file   = /mail/tls/\${mydomain}.key
+smtpd_use_tls        = yes
+smtpd_tls_auth_only  = yes
+
+smtpd_tls_session_cache_database = btree:\${data_directory}/smtpd_scache
+smtp_tls_session_cache_database  = btree:\${data_directory}/smtp_scache
+
+alias_maps           = hash:/etc/aliases
+alias_database       = hash:/etc/aliases
+
+relayhost            =
+mailbox_size_limit   = 0
+recipient_delimiter  = +
+inet_interfaces      = all
+
+qmqpd_authorized_clients = 127.0.0.0/8
+
+mydestination =
+  localhost.\$mydomain
+  localhost
+
+mynetworks =
+  127.0.0.0/8
+  [::ffff:127.0.0.0]/104
+  [::1]/128
+
+smtpd_helo_required = yes
+
+smtpd_relay_restrictions =
+  reject_non_fqdn_sender
+  reject_non_fqdn_recipient
+  reject_unknown_sender_domain
+  reject_unknown_recipient_domain
+  reject_non_fqdn_hostname
+  reject_invalid_hostname
+  permit_mynetworks
+  permit_sasl_authenticated,
+  reject_unauth_destination
+  reject_rbl_client zen.spamhaus.org
+  permit
+
+smtpd_recipient_restrictions =
+  reject_non_fqdn_sender
+  reject_non_fqdn_recipient
+  reject_unknown_sender_domain
+  reject_unknown_recipient_domain
+  reject_non_fqdn_hostname
+  reject_invalid_hostname
+  permit_mynetworks
+  permit_sasl_authenticated,
+  reject_unauth_destination
+  check_policy_service inet:127.0.0.1:10023
+  permit
+
+query                       = sqlite:\$config_directory/sql
+transport_maps              = \$query/transport.query
+
+virtual_mailbox_base        = /mail/boxes
+virtual_minimum_uid         = 100
+virtual_uid_maps            = static:$vmail_uid
+virtual_gid_maps            = static:$vmail_gid
+virtual_mailbox_domains     = \$transport_maps
+virtual_mailbox_maps        = \$query/vmailbox.query
+virtual_alias_maps          = \$query/valiases.query
+
+# the following is needed for Delivered-To: header appending,
+# per the 'D' pipe flag in master.cf (for dovecot LDA)
+virtual_destination_recipient_limit = 1
+
+smtpd_sasl_auth_enable      = yes
+smtpd_sasl_security_options = noanonymous
+smtpd_sasl_type             = dovecot
+smtpd_sasl_path             = private/auth
+queue_directory             = /var/spool/postfix
+
+#debug_peer_list = {{DEBUG_PEERS}}
+EOF
+if [[ -n "${DEBUG_PEERS:-}" ]]; then
+	log "Enabling debugging of SMTP connections from [$DEBUG_PEERS]..."
+	sed -i -e "s/{{DEBUG_PEERS}}/${DEBUG_PEERS}/;/#debug_peer_list /s/^#//" \
+		/etc/postfix/main.cf
+fi
+
+cat > /etc/postfix/master.cf <<EOF
+smtp          inet  n       -       n       -       -       smtpd
+submission    inet  n       -       n       -       -       smtpd
+127.0.0.1:628 inet  n       -       n       -       -       qmqpd
+pickup        unix  n       -       n       60      1       pickup
+cleanup       unix  n       -       n       -       0       cleanup
+qmgr          unix  n       -       n       300     1       qmgr
+tlsmgr        unix  -       -       n       1000?   1       tlsmgr
+rewrite       unix  -       -       n       -       -       trivial-rewrite
+bounce        unix  -       -       n       -       0       bounce
+defer         unix  -       -       n       -       0       bounce
+trace         unix  -       -       n       -       0       bounce
+verify        unix  -       -       n       -       1       verify
+flush         unix  n       -       n       1000?   0       flush
+proxymap      unix  -       -       n       -       -       proxymap
+proxywrite    unix  -       -       n       -       1       proxymap
+smtp          unix  -       -       n       -       -       smtp
+relay         unix  -       -       n       -       -       smtp
+showq         unix  n       -       n       -       -       showq
+error         unix  -       -       n       -       -       error
+retry         unix  -       -       n       -       -       error
+discard       unix  -       -       n       -       -       discard
+local         unix  -       n       n       -       -       local
+virtual       unix  -       n       n       -       -       pipe
+  flags=DRhu user=vmail:vmail argv=/usr/lib/dovecot/deliver -f \${sender} -d \${recipient}
+lmtp          unix  -       -       n       -       -       lmtp
+anvil         unix  -       -       n       -       1       anvil
+scache        unix  -       -       n       -       1       scache
+EOF
+
+mkdir -p /etc/postfix/sql
+cat > /etc/postfix/sql/transport.query <<EOF
+dbpath = /mail/vmail.db
+query  = SELECT transport FROM transport WHERE domain = '%s'
+EOF
+cat > /etc/postfix/sql/valiases.query <<EOF
+dbpath = /mail/vmail.db
+query  = SELECT address FROM aliases WHERE alias = '%s'
+EOF
+cat > /etc/postfix/sql/vmailbox.query <<EOF
+dbpath = /mail/vmail.db
+query  = SELECT postfix FROM users WHERE address = '%s'
+EOF
+
+log "Configuring Dovecot IMAP/POP3 mail access services..."
+cat > /etc/dovecot/dovecot.conf <<EOF
+base_dir = /var/run/dovecot/
+protocols = imap pop3
+listen = *,[::]
+disable_plaintext_auth = no
+shutdown_clients = yes
+syslog_facility = mail
+
+mail_location = maildir:/mail/boxes/%d/%n
+mail_uid      = $vmail_uid
+mail_gid      = $vmail_gid
+mail_max_userip_connections = 20
+
+passdb sql {
+  driver = sql
+  args = /etc/dovecot/sql.conf
+}
+userdb sql {
+  driver = sql
+  args = /etc/dovecot/sql.conf
+}
+
+auth_mechanisms = plain login
+service auth {
+  unix_listener /var/spool/postfix/private/auth {
+    mode  = 0660
+    user  = postfix
+    group = postfix
+  }
+}
+
+ssl = required
+ssl_cert = </mail/tls/$PRIMARY_DOMAIN.cer
+ssl_key  = </mail/tls/$PRIMARY_DOMAIN.key
+ssl_verify_client_cert = no
+ssl_cipher_list = ALL:!LOW:!SSLv2
+
+protocol lda {
+  mail_plugins = sieve
+}
+plugin {
+  sieve_global_dir = /mail/sieve/global/
+  sieve = /mail/sieve/%u.sieve
+}
+EOF
+
+cat > /etc/dovecot/sql.conf <<EOF
+driver              = sqlite
+connect             = /mail/vmail.db
+default_pass_scheme = SSHA256
+password_query      = SELECT address AS user, password FROM users WHERE address = '%u' AND allow_imap = 1
+user_query          = SELECT $vmail_uid AS uid, $vmail_gid AS gid, home, maildir AS mail, '/mail/sieve/%u.sieve' AS sieve FROM users WHERE address = '%u' AND allow_imap = 1
+EOF
+
+log "Copying over 'host-wide' files into spool directory..."
+for x in /etc/hosts.conf /etc/hosts /etc/nsswitch.conf /etc/resolv.conf /etc/services; do
+  if [[ -f $x ]]; then
+    cp -v $x /var/spool/postfix/etc/
+  fi
+done
+echo
+echo DONE
+
+echo
+echo
+echo
+exec "$@"
+exit 1

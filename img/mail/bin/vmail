@@ -1,0 +1,587 @@
+#!/usr/bin/perl
+package Nifty::Mail;
+
+use strict;
+use warnings;
+use DBI;
+
+our $VERSION = '1.0.0';
+
+sub new
+{
+	my ($class, $dsn) = @_;
+	my $self = {
+		db => DBI->connect($dsn, '', '', 
+			{ AutoCommit => 1,
+			  RaiseError => 1 }),
+	};
+	bless($self, $class);
+}
+
+sub sql
+{
+	my ($self, $sql, @params) = @_;
+	my $q = $self->{db}->prepare($sql);
+	$q->execute(@params);
+	return $q;
+}
+
+sub _where
+{
+	my (%where) = @_;
+	my @fields = ();
+	my @values = ();
+	for (keys %where) {
+		push @fields, "$_ = ?";
+		push @values, $where{$_};
+	}
+	return "1" unless @values;
+	return (join(' AND ', @fields), @values);
+}
+
+sub select
+{
+	my $extra = '';
+	if (@_ % 2 == 1) {
+		$extra = pop @_;
+	}
+	my ($self, $from, %where) = @_;
+
+	my ($clause, @params) = _where(%where);
+	my @results = ();
+	my $q = $self->sql("SELECT * FROM $from WHERE $clause $extra",
+		@params);
+	while (my $r = $q->fetchrow_hashref) {
+		push @results, $r;
+	}
+	@results;
+}
+
+sub insert
+{
+	my ($self, $into, %attrs) = @_;
+	my @fields = ();
+	my @values = ();
+
+	for (keys %attrs) {
+		push @fields, $_;
+		push @values, $attrs{$_};
+	}
+
+	my $sql = "INSERT INTO $into (".
+		join(',', @fields).") VALUES (".
+		join(',', map { '?' } @fields).")";
+
+	$self->sql($sql, @values);
+}
+
+sub delete
+{
+	my ($self, $from, %where) = @_;
+	my ($clause, @values) = _where(%where);
+	$self->sql("DELETE FROM $from WHERE $clause", @values);
+}
+
+sub find_domains
+{
+	my ($self) = @_;
+	$self->select('transport', 'ORDER BY domain ASC');
+}
+
+sub new_domain
+{
+	my ($self, $transport, $domain) = @_;
+	$self->insert('transport',
+		transport => "$transport:",
+		domain    => $domain);
+}
+
+sub rm_domain
+{
+	my ($self, $transport, $domain) = @_;
+	$self->delete('transport',
+		transport => "$transport:",
+		domain    => $domain);
+}
+
+sub find_mailboxes
+{
+	my ($self, $domain) = @_;
+	my %where = ();
+	$where{domain} = $domain if $domain;
+	$self->select('users', %where, 'ORDER BY address ASC');
+}
+
+sub new_mailbox
+{
+	my ($self, $user, $domain, $name, $password) = @_;
+	$self->insert('accounts',
+		username  => $user,
+		domain    => $domain,
+		name      => $name,
+		password  => $password,
+	);
+}
+
+sub rm_mailbox
+{
+	my ($self, $user, $domain) = @_;
+	$self->delete('accounts',
+		username  => $user,
+		domain    => $domain,
+	);
+}
+
+sub find_aliases
+{
+	my ($self) = @_;
+	$self->select('aliases', 'ORDER BY alias ASC');
+}
+
+sub new_alias
+{
+	my ($self, $alias, $address) = @_;
+	$self->insert('aliases',
+		alias   => $alias,
+		address => $address,
+	);
+}
+
+sub rm_alias
+{
+	my ($self, $alias) = @_;
+	$self->delete('aliases', alias => $alias);
+}
+
+sub passwd
+{
+	my $prog = '/usr/bin/doveadm';
+	-x $prog or die "Can't find $prog; is Dovecot installed?\n";
+
+	my $pw = qx($prog pw -s SSHA256);
+	$pw =~ s/\n$//;
+	return $pw;
+}
+
+sub set_passwd
+{
+	my ($self, $email, $password) = @_;
+	my ($user, $domain) = split /\@/, $email;
+	$self->sql("UPDATE accounts SET password = ? ".
+		"WHERE username = ? AND domain = ?",
+		$password, $user, $domain);
+}
+
+1;
+
+=head1 NAME
+
+Nifty::Mail - Email Platform Management
+
+=head1 DESCRIPTION
+
+Nifty::Mail provides a database schema, suggested configurations for
+Dovecot / Postfix, and a tool (vmail) that can collectively manage
+a multi-domain email server easily.
+
+=head1 METHODS
+
+=head2 new($dsn)
+
+Create a new Nifty::Mail handle, attaching it to the database
+identified by B<$dsn>.  If the connection fails, DBI will die,
+so you may want to call this from inside of an eval { ... } block.
+
+=head2 sql($sql, @params)
+
+Prepare a SQL statement, bind parameters to it, and execute it
+against the database handle.  Returns the prepared statements,
+which can be used for retrieving results.
+
+=head2 select($from, %where, [$extra_sql])
+
+Select records from the database, returning an array of hashrefs.
+The B<%where> hash will be turned into a WHERE clause.  If no
+conditions are given, all rows will be returned.
+
+If B<$extra_sql> is given, it will be tacked onto the end of the
+SQL query, after the WHERE clause.
+
+=head2 insert($into, %attrs)
+
+Insert a new record into a table in the database.  The B<%attrs>
+hash is taken as a field => value map of the columns that should
+be populated.
+
+=head2 delete($from, %where)
+
+Delete records from a table that match the AND'ed WHERE clause
+specified by B<%where>.  If B<%where> is empty, all records will
+be deleted.
+
+=head2 find_domains
+
+Retrieve a list of all domains defined.
+
+=head2 new_domain($transport, $domain)
+
+Define a new domain, with the given Postfix transport (usually,
+C<virtual>).
+
+=head2 rm_domain($transport, $domain)
+
+Remove the domain definition that matches the transport and domain
+name.
+
+=head2 find_mailboxes([$domain])
+
+Retrieve a list of all mailboxes, optionally filtered to those on
+the given B<$domain>.
+
+=head2 new_mailbox($user, $domain, $full_name, $password)
+
+Create a new mailbox in the database.  Note that filesystem storage
+will not be allocated, that' is left to Postfix and/or Dovecot.
+
+=head2 rm_mailbox($user, $domain)
+
+Delete a mailbox.
+
+=head2 find_aliases
+
+Retrieve a list of all defined aliases.  Filtering is not currently
+possible.
+
+=head2 new_alias($alias, $email)
+
+Define a new alias email.  Both B<$alias> and B<$email> must have
+user and domain components.
+
+=head2 rm_alias($alias)
+
+Remove an alias rule from the database.
+
+=head2 passwd
+
+Run the dovecotpw command and return the encrypted password that
+it generated.  The end user will be responsible for typing the
+password into the console.
+
+=head2 set_passwd($email, $password)
+
+Update the password of B<$email>.  B<$password> should be the
+SSHA_256 hashed version of the password, not the cleartext.
+
+=head1 AUTHOR
+
+Written by James Hunt <james@niftylogic.com>
+
+=cut
+
+package main;
+
+eval 'exec /usr/bin/perl  -S $0 ${1+"$@"}'
+	if 0; # not running under some shell
+
+use warnings;
+use strict;
+use Getopt::Long;
+my $V;
+my %OPTIONS;
+
+#########################################################################
+
+sub usage
+{
+	my ($str, @rest) = @_;
+	print "vmail - Virtual Mail Controller\n";
+	print "USAGE: $str\n";
+	print "       $_\n" for @rest;
+	exit 1;
+}
+sub help
+{
+	print "vmail - Virtual Mail Controller\n";
+	print "Copyright (c) 2013-2019 James Hunt\n";
+	print "\n";
+	print "USAGE: $0 cmd type [options]\n";
+	print "\n";
+	print "  help   - This help screen\n";
+	print "\n";
+	print "  list domains\n";
+	print "   add domain <domain>\n";
+	print "    rm domain <domain>\n";
+	print "\n";
+	print "  list aliases\n";
+	print "   add alias <alias> <address>\n";
+	print "    rm alias <alias>\n";
+	print "\n";
+	print "  list mailboxes [domain]\n";
+	print "   new mailbox <address> <display name>\n";
+	print "    rm mailbox <address>\n";
+	print "\n";
+	print "  passwd <address>\n";
+	print "\n";
+	exit 0;
+}
+
+sub lpad
+{
+	my ($s, $l, $f) = (@_);
+	my $n = $l - length $s;
+	return $n > 0 ? $s . (($f || ' ') x $n)
+	              : $s;
+}
+
+sub rpad
+{
+	my ($s, $l, $f) = (@_);
+	my $n = $l - length $s;
+	return $n > 0 ? (($f || ' ') x $n) . $s
+	              :                      $s;
+}
+
+sub list_domains
+{
+	for my $t ($V->find_domains) {
+		print rpad($t->{transport}, 15), " ", $t->{domain}, "\n";
+	}
+	exit 0;
+}
+
+sub new_domain
+{
+	my ($spec) = @_;
+	my ($transport, $domain) = split /\s*:\s*/, $spec;
+	if (!$transport || !$domain) {
+		usage("$0 add domain virtual:example.com",
+		      "$0 add domain local:example.int");
+	}
+	$V->new_domain($transport, $domain);
+}
+
+sub new_domains
+{
+	if (!@_) {
+		usage("$0 add domain virtual:example.com",
+		      "$0 add domain local:example.int");
+	}
+	new_domain $_ for @_;
+	list_domains unless $OPTIONS{quiet};
+}
+
+sub rm_domain
+{
+	my ($spec) = @_;
+	my ($transport, $domain) = split /\s*:\s*/, $spec;
+	if (!$transport || !$domain) {
+		usage("$0 rm domain virtual:example.com",
+		      "$0 rm domain local:example.int");
+	}
+	$V->rm_domain($transport, $domain);
+}
+
+sub rm_domains
+{
+	if (!@_) {
+		usage("$0 rm domain virtual:example.com",
+		      "$0 rm domain local:example.int");
+	}
+	rm_domain $_ for @_;
+	list_domains unless $OPTIONS{quiet};
+}
+
+sub list_mailboxes
+{
+	for my $m ($V->find_mailboxes(@_)) {
+		print '"', $m->{name}, '" <', $m->{address}, ">\n";
+	}
+}
+
+sub new_mailbox
+{
+	my ($email, $name, $password) = @_;
+	# FIXME: set default, scrambled password
+	$password = "xlkjralkjaslkjmljllakn" unless $password;
+
+	my ($user, $domain) = split /\@/, $email;
+	if (!$user || !$domain || !$name) {
+		usage("$0 add mailbox user\@example.com 'Full Name'",
+		      "$0 add mailbox user\@example.com 'Full Name' password");
+	}
+	$V->new_mailbox($user, $domain, $name, $password);
+	list_mailboxes($domain) unless $OPTIONS{quiet};
+}
+
+sub rm_mailbox
+{
+	my ($email) = @_;
+	my ($user, $domain) = split /\@/, $email;
+	if (!$user || !$domain) {
+		usage("$0 rm mailbox user\@example.com");
+	}
+	$V->rm_mailbox($user, $domain);
+	list_mailboxes($domain) unless $OPTIONS{quiet};
+}
+
+sub list_aliases
+{
+	for my $a ($V->find_aliases) {
+		print rpad($a->{alias}, 30), " -> ", $a->{address}, "\n";
+	}
+}
+
+sub new_alias
+{
+	my ($alias, $real) = @_;
+	my ($a_user, $a_domain) = split /\@/, $alias;
+	my ($r_user, $r_domain) = split /\@/, $real;
+	$a_domain = $r_domain unless $a_domain;
+
+	if (!$a_domain || !$r_user || !$r_domain) {
+		usage("$0 add alias me\@example.com",
+		      "$0 add alias\@other.domain.com me\@domain.net");
+	}
+
+	$alias = "$a_user\@$a_domain";
+	$real  = "$r_user\@$r_domain";
+
+	$V->new_alias($alias, $real);
+	list_aliases unless $OPTIONS{quiet};
+}
+
+sub rm_alias
+{
+	my ($alias) = @_;
+	my ($a_user, $a_domain) = split /\@/, $alias;
+
+	if (!$a_user || !$a_domain) {
+		usage("$0 rm alias aka\@example.org");
+	}
+	$V->rm_alias($alias);
+}
+
+sub rm_aliases
+{
+	if (!@_) {
+		usage("$0 rm alias aka\@example.org");
+	}
+	rm_alias $_ for @_;
+	list_aliases unless $OPTIONS{quiet};
+}
+
+sub passwd
+{
+	my ($email) = @_;
+	my ($user, $domain) = split /\@/, $email;
+
+	if (!$user || !$domain) {
+		usage("$0 passwd user\@domain.name");
+	}
+
+	my $pass = $V->passwd;
+	if (!$pass) {
+		print STDERR "not updating password.\n";
+		exit 1;
+	}
+
+	$V->set_passwd($email, $pass);
+	print STDERR "password changed.\n";
+}
+
+sub op($)
+{
+	$_ = shift || "";
+	if (/^(list|ls)$/)  { return "ls";   }
+	if (/^(new|add)$/)  { return "add";  }
+	if (/^(del|rm)$/)   { return "rm";   }
+	if (/^(help|\?|)$/) { return "help"; }
+	if (/^(passw(or)?d|reset)$/) { return "passwd"; }
+	return $_;
+}
+
+sub type($)
+{
+	$_ = shift || "";
+	if (/^(transports?|domains?)$/)   { return "domain"; }
+	if (/^(alias(es)?)$/)             { return "alias";  }
+	if (/^(m(ail)?box(es)?|users?)$/) { return "mbox";   }
+	return $_;
+}
+
+sub schema
+{
+	print <<'EOF';
+CREATE TABLE accounts (
+	username character varying(127) NOT NULL,
+	domain character varying(128) NOT NULL,
+	name character varying(255) NOT NULL,
+	password character varying(128) NOT NULL,
+	PRIMARY KEY (username, domain)
+);
+
+CREATE TABLE aliases (
+	alias character varying(255) NOT NULL,
+	address character varying(255) NOT NULL,
+	PRIMARY KEY (alias)
+);
+
+CREATE TABLE transport (
+	domain character varying(128) NOT NULL,
+	transport character varying(50),
+	PRIMARY KEY (domain)
+);
+
+CREATE VIEW users AS SELECT
+	accounts.username || '@' || accounts.domain AS address,
+	accounts.domain,
+	accounts.password,
+	accounts.name,
+	        '/mail/boxes/' || accounts.domain || '/' || accounts.username AS home,
+	'maildir:/mail/boxes/' || accounts.domain || '/' || accounts.username AS maildir,
+	                          accounts.domain || '/' || accounts.username || '/' as postfix,
+	1 AS allow_imap
+FROM accounts;
+EOF
+	exit 0;
+}
+
+#########################################################################
+
+$OPTIONS{database} = $ENV{VMAILDB} || '/mail/vmail.db';
+GetOptions(\%OPTIONS,
+	'help|h|?',
+	'database|d=s',
+	'quiet|q',
+) || help;
+help if $OPTIONS{help};
+
+eval { $V = Nifty::Mail->new("dbi:SQLite:dbname=$OPTIONS{database}") }
+	or die "Failed to connect ($OPTIONS{database}): ".DBI->errstr."\n";
+
+
+my $op = op(shift @ARGV);
+if ($op !~ m/^(passwd|help|schema)$/) {
+	$op = "$op-" . type(shift @ARGV);
+}
+
+     if ($op eq  "ls-domain") {  list_domains;
+} elsif ($op eq "add-domain") {  new_domains @ARGV;
+} elsif ($op eq  "rm-domain") {  rm_domains  @ARGV;
+
+} elsif ($op eq  "ls-alias")  {  list_aliases;
+} elsif ($op eq "add-alias")  {  new_alias  @ARGV;
+} elsif ($op eq  "rm-alias")  {  rm_aliases @ARGV;
+
+} elsif ($op eq  "ls-mbox")   {  list_mailboxes;
+} elsif ($op eq "add-mbox")   {  new_mailbox @ARGV, "PASSWORD";
+} elsif ($op eq  "rm-mbox")   {  rm_mailbox  @ARGV;
+
+} elsif ($op eq "help")       {  help;
+} elsif ($op eq "passwd")     {  passwd @ARGV;
+} elsif ($op eq "schema")     {  schema;
+} else {
+	$op =~ s/-/ /;
+	print STDERR "Unknown command: $op\nTry $0 help\n";
+	exit 1;
+}
